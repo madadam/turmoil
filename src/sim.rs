@@ -201,85 +201,105 @@ impl<'a> Sim<'a> {
     ///
     /// If any client errors, the simulation returns early with that Error.
     pub fn run(&mut self) -> Result {
-        let tick = self.config.tick;
-
         loop {
-            let mut is_finished = true;
-            let mut finished = vec![];
-
-            // Tick the networking, processing messages. This is done before
-            // ticking any other runtime, as they might be waiting on network
-            // IO. (It also might be waiting on something else, such as time.)
-            self.world.borrow_mut().topology.tick_by(tick);
-
-            for (&addr, rt) in self.rts.iter() {
-                {
-                    let mut world = self.world.borrow_mut();
-                    // We need to move deliverable messages off the network and
-                    // into the dst host. This requires two mutable borrows.
-                    let World {
-                        rng,
-                        topology,
-                        hosts,
-                        ..
-                    } = world.deref_mut();
-                    topology.deliver_messages(rng, hosts.get_mut(&addr).expect("missing host"));
-
-                    // Set the current host (see method docs)
-                    world.current = Some(addr);
-
-                    world.current_host_mut().now(rt.now());
-                }
-
-                World::enter(&self.world, || rt.tick(tick));
-
-                // Unset the current host
-                let mut world = self.world.borrow_mut();
-                world.current = None;
-
-                world.tick(addr, tick);
-
-                match rt {
-                    Role::Client { handle, .. } => {
-                        if handle.is_finished() {
-                            finished.push(addr);
-                        }
-                        is_finished = is_finished && handle.is_finished();
-                    }
-                    Role::Simulated { handle, .. } => {
-                        if handle.is_finished() {
-                            finished.push(addr);
-                        }
-                    }
-                }
-            }
-
-            self.elapsed += tick;
-
-            // Check finished clients and hosts for err results. Runtimes are removed at
-            // this stage.
-            for addr in finished.into_iter() {
-                if let Some(role) = self.rts.remove(&addr) {
-                    let (rt, handle) = match role {
-                        Role::Client { rt, handle } => (rt, handle),
-                        Role::Simulated { rt, handle, .. } => (rt, handle),
-                    };
-                    rt.block_on(handle)??;
-                }
-            }
-
-            if is_finished {
-                return Ok(());
-            }
-
-            if self.elapsed > self.config.duration {
-                Err(format!(
-                    "Ran for {:?} without completing",
-                    self.config.duration
-                ))?;
+            match self.step()? {
+                SimStatus::Running => (),
+                SimStatus::Finished => return Ok(()),
             }
         }
     }
+
+    /// Advance the simulation by a single tick. Returns the simulation status (running/finished)
+    /// or error in case any client errors.
+    ///
+    /// This is useful when the user wants to handle their own even loop. Otherwise it's more
+    /// convenient to use `[Self::run]`.
+    pub fn step(&mut self) -> Result<SimStatus> {
+        let tick = self.config.tick;
+
+        let mut is_finished = true;
+        let mut finished = vec![];
+
+        // Tick the networking, processing messages. This is done before
+        // ticking any other runtime, as they might be waiting on network
+        // IO. (It also might be waiting on something else, such as time.)
+        self.world.borrow_mut().topology.tick_by(tick);
+
+        for (&addr, rt) in self.rts.iter() {
+            {
+                let mut world = self.world.borrow_mut();
+                // We need to move deliverable messages off the network and
+                // into the dst host. This requires two mutable borrows.
+                let World {
+                    rng,
+                    topology,
+                    hosts,
+                    ..
+                } = world.deref_mut();
+                topology.deliver_messages(rng, hosts.get_mut(&addr).expect("missing host"));
+
+                // Set the current host (see method docs)
+                world.current = Some(addr);
+
+                world.current_host_mut().now(rt.now());
+            }
+
+            World::enter(&self.world, || rt.tick(tick));
+
+            // Unset the current host
+            let mut world = self.world.borrow_mut();
+            world.current = None;
+
+            world.tick(addr, tick);
+
+            match rt {
+                Role::Client { handle, .. } => {
+                    if handle.is_finished() {
+                        finished.push(addr);
+                    }
+                    is_finished = is_finished && handle.is_finished();
+                }
+                Role::Simulated { handle, .. } => {
+                    if handle.is_finished() {
+                        finished.push(addr);
+                    }
+                }
+            }
+        }
+
+        self.elapsed += tick;
+
+        // Check finished clients and hosts for err results. Runtimes are removed at
+        // this stage.
+        for addr in finished.into_iter() {
+            if let Some(role) = self.rts.remove(&addr) {
+                let (rt, handle) = match role {
+                    Role::Client { rt, handle } => (rt, handle),
+                    Role::Simulated { rt, handle, .. } => (rt, handle),
+                };
+                rt.block_on(handle)??;
+            }
+        }
+
+        if is_finished {
+            return Ok(SimStatus::Finished);
+        }
+
+        if self.elapsed > self.config.duration {
+            return Err(format!(
+                "Ran for {:?} without completing",
+                self.config.duration
+            ))?;
+        }
+
+        Ok(SimStatus::Running)
+    }
+}
+
+#[derive(Eq, PartialEq, Debug)]
+pub enum SimStatus {
+    Running,
+    Finished,
 }
 
 #[cfg(test)]

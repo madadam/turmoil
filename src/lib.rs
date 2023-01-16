@@ -33,7 +33,7 @@ mod rt;
 use rt::Rt;
 
 mod sim;
-pub use sim::Sim;
+pub use sim::{Sim, SimStatus};
 
 mod top;
 use top::Topology;
